@@ -428,7 +428,7 @@
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeModal()">取消</button>
-      <button class="btn btn-primary" onclick="confirmBooking()">確認預約</button>
+      <button id="btn-confirm" class="btn btn-primary" onclick="confirmBooking()">確認預約</button>
     </div>
   </div>
 </div>
@@ -436,7 +436,9 @@
 <div class="toast" id="toast"></div>
 
 <script>
-  // Generate time slots
+  // 後端 API 位址（與 server.js 的 PORT 對應）
+  const API_BASE = 'http://localhost:3001/api';
+
   function generateSlots(startH, startM, endH, endM) {
     const slots = [];
     let h = startH, m = startM;
@@ -445,7 +447,7 @@
       const nextH = nextM >= 60 ? h + 1 : h;
       const actualNextM = nextM >= 60 ? nextM - 60 : nextM;
       const time = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
-      slots.push({ time, id: `slot-${h}-${m}`, booked: null });
+      slots.push({ time, id: `slot-${h}-${m}` });
       h = nextH; m = actualNextM;
     }
     return slots;
@@ -455,15 +457,40 @@
   const afternoon = generateSlots(13, 0, 16, 0);
 
   const MAX_BOOKINGS = 7;
-  let bookings = JSON.parse(localStorage.getItem('interview-bookings') || '{}');
+  // bookings 格式：{ slotId: { time, name, bookedAt } }
+  let bookings = {};
   let pendingSlotId = null;
+  let pendingTime = null;
+  let isSubmitting = false;
 
-  function saveBookings() {
-    localStorage.setItem('interview-bookings', JSON.stringify(bookings));
+  // 從後端載入預約資料（啟動時呼叫）
+  async function loadBookings() {
+    try {
+      const res = await fetch(`${API_BASE}/bookings`);
+      if (!res.ok) throw new Error('無法連線後端');
+      const data = await res.json();
+      bookings = data.bookings || {};
+    } catch {
+      // 後端未啟動時，降級為 localStorage
+      bookings = JSON.parse(localStorage.getItem('interview-bookings') || '{}');
+      // 將舊格式（{ slotId: name }）轉換為新格式
+      for (const [id, val] of Object.entries(bookings)) {
+        if (typeof val === 'string') {
+          bookings[id] = { name: val, time: id.replace('slot-', '').replace('-', ':'), bookedAt: '' };
+        }
+      }
+    }
+    renderSlots();
   }
 
   function getTotalBooked() {
     return Object.keys(bookings).length;
+  }
+
+  function getBookedName(slotId) {
+    const entry = bookings[slotId];
+    if (!entry) return null;
+    return typeof entry === 'object' ? entry.name : entry;
   }
 
   function renderSlots() {
@@ -479,7 +506,7 @@
       grid.className = 'slots';
 
       slots.forEach(slot => {
-        const bookedName = bookings[slot.id];
+        const bookedName = getBookedName(slot.id);
         const isBooked = !!bookedName;
         const isFull = !isBooked && total >= MAX_BOOKINGS;
 
@@ -520,18 +547,25 @@
   function openModal(slotId, time) {
     if (getTotalBooked() >= MAX_BOOKINGS) return;
     pendingSlotId = slotId;
+    pendingTime = time;
     document.getElementById('modal-time').textContent = time;
     document.getElementById('input-name').value = '';
     document.getElementById('modal').classList.add('active');
+    const confirmBtn = document.getElementById('btn-confirm');
+    confirmBtn.textContent = '確認預約';
+    confirmBtn.disabled = false;
     setTimeout(() => document.getElementById('input-name').focus(), 100);
   }
 
   function closeModal() {
     document.getElementById('modal').classList.remove('active');
     pendingSlotId = null;
+    pendingTime = null;
+    isSubmitting = false;
   }
 
-  function confirmBooking() {
+  async function confirmBooking() {
+    if (isSubmitting) return;
     const name = document.getElementById('input-name').value.trim();
     if (!name) {
       document.getElementById('input-name').focus();
@@ -539,11 +573,45 @@
       setTimeout(() => document.getElementById('input-name').style.borderColor = '', 1000);
       return;
     }
-    bookings[pendingSlotId] = name;
-    saveBookings();
-    closeModal();
-    renderSlots();
-    showToast(`✓  ${name} 已完成預約`);
+
+    isSubmitting = true;
+    const confirmBtn = document.getElementById('btn-confirm');
+    confirmBtn.textContent = '儲存中…';
+    confirmBtn.disabled = true;
+
+    try {
+      const res = await fetch(`${API_BASE}/bookings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slotId: pendingSlotId, time: pendingTime, name })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        showToast(`⚠ ${data.error || '預約失敗，請再試一次'}`);
+        confirmBtn.textContent = '確認預約';
+        confirmBtn.disabled = false;
+        isSubmitting = false;
+        return;
+      }
+
+      // 更新本地快取
+      bookings[pendingSlotId] = { time: pendingTime, name, bookedAt: data.entry?.bookedAt || '' };
+      localStorage.setItem('interview-bookings', JSON.stringify(bookings));
+
+      closeModal();
+      renderSlots();
+      showToast(`✓  ${name} 已完成預約，資料已寫入 Excel`);
+
+    } catch {
+      // 後端無法連線時，降級儲存至 localStorage
+      bookings[pendingSlotId] = { time: pendingTime, name, bookedAt: new Date().toLocaleString('zh-TW') };
+      localStorage.setItem('interview-bookings', JSON.stringify(bookings));
+      closeModal();
+      renderSlots();
+      showToast(`✓  ${name} 已完成預約（離線模式）`);
+    }
   }
 
   function showToast(msg) {
@@ -553,17 +621,15 @@
     setTimeout(() => t.classList.remove('show'), 2800);
   }
 
-  // Close on overlay click
   document.getElementById('modal').addEventListener('click', function(e) {
     if (e.target === this) closeModal();
   });
 
-  // Enter key
   document.getElementById('input-name').addEventListener('keydown', e => {
     if (e.key === 'Enter') confirmBooking();
   });
 
-  renderSlots();
+  loadBookings();
 </script>
 </body>
 </html>
